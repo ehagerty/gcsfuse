@@ -1,4 +1,4 @@
-// Copyright 2015 Google Inc. All Rights Reserved.
+// Copyright 2015 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,22 +15,38 @@
 package gcsx
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"os"
+	"path"
+	"reflect"
 	"strings"
 	"testing"
 	"testing/iotest"
 	"time"
 
-	"github.com/jacobsa/gcloud/gcs"
+	"github.com/googlecloudplatform/gcsfuse/v2/cfg"
+	"github.com/googlecloudplatform/gcsfuse/v2/common"
+	"github.com/googlecloudplatform/gcsfuse/v2/internal/cache/file"
+	"github.com/googlecloudplatform/gcsfuse/v2/internal/cache/file/downloader"
+	"github.com/googlecloudplatform/gcsfuse/v2/internal/cache/lru"
+	"github.com/googlecloudplatform/gcsfuse/v2/internal/cache/util"
+	"github.com/googlecloudplatform/gcsfuse/v2/internal/fs/gcsfuse_errors"
+	"github.com/googlecloudplatform/gcsfuse/v2/internal/storage"
+	"github.com/googlecloudplatform/gcsfuse/v2/internal/storage/fake"
+	"github.com/googlecloudplatform/gcsfuse/v2/internal/storage/gcs"
+	testutil "github.com/googlecloudplatform/gcsfuse/v2/internal/util"
+	"github.com/jacobsa/fuse/fuseops"
 	. "github.com/jacobsa/oglematchers"
 	. "github.com/jacobsa/oglemock"
 	. "github.com/jacobsa/ogletest"
 	"golang.org/x/net/context"
 )
 
+// NOTE: Please add new tests in random_reader_stretchr_test.go file. This file
+// is deprecated and these tests will be moved to the random_reader_stretchr_test.go
 func TestRandomReader(t *testing.T) { RunTests(t) }
 
 ////////////////////////////////////////////////////////////////////////
@@ -42,7 +58,7 @@ type checkingRandomReader struct {
 	wrapped *randomReader
 }
 
-func (rr *checkingRandomReader) ReadAt(p []byte, offset int64) (int, error) {
+func (rr *checkingRandomReader) ReadAt(p []byte, offset int64) (ObjectData, error) {
 	rr.wrapped.CheckInvariants()
 	defer rr.wrapped.CheckInvariants()
 	return rr.wrapped.ReadAt(rr.ctx, p, offset)
@@ -130,10 +146,17 @@ func rangeLimitIs(expected uint64) (m Matcher) {
 // Boilerplate
 ////////////////////////////////////////////////////////////////////////
 
+const sequentialReadSizeInMb = 22
+const sequentialReadSizeInBytes = sequentialReadSizeInMb * MB
+const CacheMaxSize = 2 * sequentialReadSizeInMb * util.MiB
+
 type RandomReaderTest struct {
-	object *gcs.Object
-	bucket gcs.MockBucket
-	rr     checkingRandomReader
+	object       *gcs.MinObject
+	bucket       storage.MockBucket
+	rr           checkingRandomReader
+	cacheDir     string
+	jobManager   *downloader.JobManager
+	cacheHandler *file.CacheHandler
 }
 
 func init() { RegisterTestSuite(&RandomReaderTest{}) }
@@ -142,26 +165,51 @@ var _ SetUpInterface = &RandomReaderTest{}
 var _ TearDownInterface = &RandomReaderTest{}
 
 func (t *RandomReaderTest) SetUp(ti *TestInfo) {
-	t.rr.ctx = ti.Ctx
+	readOp := fuseops.ReadFileOp{Handle: 1}
+	t.rr.ctx = context.WithValue(ti.Ctx, ReadOp, &readOp)
 
 	// Manufacture an object record.
-	t.object = &gcs.Object{
+	t.object = &gcs.MinObject{
 		Name:       "foo",
 		Size:       17,
 		Generation: 1234,
 	}
 
 	// Create the bucket.
-	t.bucket = gcs.NewMockBucket(ti.MockController, "bucket")
+	t.bucket = storage.NewMockBucket(ti.MockController, "bucket")
+
+	t.cacheDir = path.Join(os.Getenv("HOME"), "cache/dir")
+	lruCache := lru.NewCache(CacheMaxSize)
+	t.jobManager = downloader.NewJobManager(lruCache, util.DefaultFilePerm, util.DefaultDirPerm, t.cacheDir, sequentialReadSizeInMb, &cfg.FileCacheConfig{
+		EnableCrc: false,
+	}, common.NewNoopMetrics())
+	t.cacheHandler = file.NewCacheHandler(lruCache, t.jobManager, t.cacheDir, util.DefaultFilePerm, util.DefaultDirPerm)
 
 	// Set up the reader.
-	rr, err := NewRandomReader(t.object, t.bucket)
-	AssertEq(nil, err)
+	rr := NewRandomReader(t.object, t.bucket, sequentialReadSizeInMb, nil, false, common.NewNoopMetrics(), nil)
 	t.rr.wrapped = rr.(*randomReader)
 }
 
 func (t *RandomReaderTest) TearDown() {
 	t.rr.Destroy()
+}
+
+func getReadCloser(content []byte) io.ReadCloser {
+	r := bytes.NewReader(content)
+	rc := io.NopCloser(r)
+	return rc
+}
+
+func (t *RandomReaderTest) mockNewReaderCallForTestBucket(start uint64, limit uint64, rd io.ReadCloser) {
+	ExpectCall(t.bucket, "NewReader")(
+		Any(), AllOf(rangeStartIs(start), rangeLimitIs(limit))).
+		WillRepeatedly(Return(rd, nil))
+}
+
+func (t *RandomReaderTest) mockNewReaderWithHandleCallForTestBucket(start uint64, limit uint64, rd gcs.StorageReader) {
+	ExpectCall(t.bucket, "NewReaderWithReadHandle")(
+		Any(), AllOf(rangeStartIs(start), rangeLimitIs(limit))).
+		WillRepeatedly(Return(rd, nil))
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -172,69 +220,86 @@ func (t *RandomReaderTest) EmptyRead() {
 	// Nothing should happen.
 	buf := make([]byte, 0)
 
-	n, err := t.rr.ReadAt(buf, 0)
-	ExpectEq(0, n)
+	objectData, err := t.rr.ReadAt(buf, 0)
+
+	ExpectEq(0, objectData.Size)
 	ExpectEq(nil, err)
 }
 
 func (t *RandomReaderTest) ReadAtEndOfObject() {
 	buf := make([]byte, 1)
 
-	n, err := t.rr.ReadAt(buf, int64(t.object.Size))
-	ExpectEq(0, n)
+	objectData, err := t.rr.ReadAt(buf, int64(t.object.Size))
+
+	ExpectEq(0, objectData.Size)
 	ExpectEq(io.EOF, err)
 }
 
 func (t *RandomReaderTest) ReadPastEndOfObject() {
 	buf := make([]byte, 1)
 
-	n, err := t.rr.ReadAt(buf, int64(t.object.Size)+1)
-	ExpectEq(0, n)
+	objectData, err := t.rr.ReadAt(buf, int64(t.object.Size)+1)
+
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(0, objectData.Size)
 	ExpectEq(io.EOF, err)
 }
 
 func (t *RandomReaderTest) NoExistingReader() {
 	// The bucket should be called to set up a new reader.
-	ExpectCall(t.bucket, "NewReader")(Any(), Any()).
+	ExpectCall(t.bucket, "NewReaderWithReadHandle")(Any(), Any()).
 		WillOnce(Return(nil, errors.New("")))
-
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
 	buf := make([]byte, 1)
-	t.rr.ReadAt(buf, 0)
+
+	_, err := t.rr.ReadAt(buf, 0)
+
+	AssertNe(nil, err)
 }
 
-func (t *RandomReaderTest) ExistingReader_WrongOffset() {
+func (t *RandomReaderTest) ExistingReader_ReadAtOffsetAfterTheReaderPosition() {
+	var currentStartOffset int64 = 2
+	var readerLimit int64 = 15
+	var readAtOffset int64 = 10
+	var readSize int64 = 1
+	var expectedStartOffsetAfterRead = readAtOffset + readSize
 	// Simulate an existing reader.
-	t.rr.wrapped.reader = ioutil.NopCloser(strings.NewReader("xxx"))
+	nopCloser := io.NopCloser(strings.NewReader(strings.Repeat("x", int(readerLimit))))
+	rc := &fake.FakeReader{ReadCloser: nopCloser}
+	t.rr.wrapped.reader = rc
 	t.rr.wrapped.cancel = func() {}
-	t.rr.wrapped.start = 2
-	t.rr.wrapped.limit = 5
+	t.rr.wrapped.start = currentStartOffset
+	t.rr.wrapped.limit = readerLimit
 
-	// The bucket should be called to set up a new reader.
-	ExpectCall(t.bucket, "NewReader")(Any(), Any()).
-		WillOnce(Return(nil, errors.New("")))
+	buf := make([]byte, readSize)
+	_, err := t.rr.ReadAt(buf, readAtOffset)
 
-	buf := make([]byte, 1)
-	t.rr.ReadAt(buf, 0)
+	AssertEq(nil, err)
+	ExpectThat(rc, DeepEquals(t.rr.wrapped.reader))
+	ExpectEq(expectedStartOffsetAfterRead, t.rr.wrapped.start)
+	ExpectEq(readerLimit, t.rr.wrapped.limit)
 }
 
 func (t *RandomReaderTest) NewReaderReturnsError() {
-	ExpectCall(t.bucket, "NewReader")(Any(), Any()).
+	ExpectCall(t.bucket, "NewReaderWithReadHandle")(Any(), Any()).
 		WillOnce(Return(nil, errors.New("taco")))
-
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
 	buf := make([]byte, 1)
+
 	_, err := t.rr.ReadAt(buf, 0)
 
-	ExpectThat(err, Error(HasSubstr("NewReader")))
+	ExpectThat(err, Error(HasSubstr("NewReaderWithReadHandle")))
 	ExpectThat(err, Error(HasSubstr("taco")))
 }
 
 func (t *RandomReaderTest) ReaderFails() {
 	// Bucket
 	r := iotest.OneByteReader(iotest.TimeoutReader(strings.NewReader("xxx")))
-	rc := ioutil.NopCloser(r)
+	rc := &fake.FakeReader{ReadCloser: io.NopCloser(r)}
 
-	ExpectCall(t.bucket, "NewReader")(Any(), Any()).
+	ExpectCall(t.bucket, "NewReaderWithReadHandle")(Any(), Any()).
 		WillOnce(Return(rc, nil))
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
 
 	// Call
 	buf := make([]byte, 3)
@@ -244,26 +309,12 @@ func (t *RandomReaderTest) ReaderFails() {
 	ExpectThat(err, Error(HasSubstr(iotest.ErrTimeout.Error())))
 }
 
-func (t *RandomReaderTest) ReaderOvershootsRange() {
-	// Simulate a reader that is supposed to return two more bytes, but actually
-	// returns three when asked to.
-	t.rr.wrapped.reader = ioutil.NopCloser(strings.NewReader("xxx"))
-	t.rr.wrapped.cancel = func() {}
-	t.rr.wrapped.start = 0
-	t.rr.wrapped.limit = 2
-
-	// Try to read three bytes.
-	buf := make([]byte, 3)
-	_, err := t.rr.ReadAt(buf, 0)
-
-	ExpectThat(err, Error(HasSubstr("1 too many bytes")))
-}
-
 func (t *RandomReaderTest) ReaderNotExhausted() {
 	// Set up a reader that has three bytes left to give.
-	rc := &countingCloser{
+	cc := &countingCloser{
 		Reader: strings.NewReader("abc"),
 	}
+	rc := &fake.FakeReader{ReadCloser: cc}
 
 	t.rr.wrapped.reader = rc
 	t.rr.wrapped.cancel = func() {}
@@ -272,13 +323,14 @@ func (t *RandomReaderTest) ReaderNotExhausted() {
 
 	// Read two bytes.
 	buf := make([]byte, 2)
-	n, err := t.rr.ReadAt(buf, 1)
+	objectData, err := t.rr.ReadAt(buf, 1)
 
-	ExpectEq(2, n)
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(2, objectData.Size)
 	ExpectEq(nil, err)
-	ExpectEq("ab", string(buf[:n]))
+	ExpectEq("ab", string(buf[:objectData.Size]))
 
-	ExpectEq(0, rc.closeCount)
+	ExpectEq(0, cc.closeCount)
 	ExpectEq(rc, t.rr.wrapped.reader)
 	ExpectEq(3, t.rr.wrapped.start)
 	ExpectEq(4, t.rr.wrapped.limit)
@@ -290,46 +342,19 @@ func (t *RandomReaderTest) ReaderExhausted_ReadFinished() {
 		Reader: strings.NewReader("abc"),
 	}
 
-	t.rr.wrapped.reader = rc
+	t.rr.wrapped.reader = &fake.FakeReader{ReadCloser: rc}
 	t.rr.wrapped.cancel = func() {}
 	t.rr.wrapped.start = 1
 	t.rr.wrapped.limit = 4
 
 	// Read three bytes.
 	buf := make([]byte, 3)
-	n, err := t.rr.ReadAt(buf, 1)
+	objectData, err := t.rr.ReadAt(buf, 1)
 
-	ExpectEq(3, n)
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(3, objectData.Size)
 	ExpectEq(nil, err)
-	ExpectEq("abc", string(buf[:n]))
-
-	ExpectEq(1, rc.closeCount)
-	ExpectEq(nil, t.rr.wrapped.reader)
-	ExpectEq(nil, t.rr.wrapped.cancel)
-	ExpectEq(4, t.rr.wrapped.limit)
-}
-
-func (t *RandomReaderTest) ReaderExhausted_ReadNotFinished() {
-	// Set up a reader that has three bytes left to give.
-	rc := &countingCloser{
-		Reader: strings.NewReader("abc"),
-	}
-
-	t.rr.wrapped.reader = rc
-	t.rr.wrapped.cancel = func() {}
-	t.rr.wrapped.start = 1
-	t.rr.wrapped.limit = 4
-
-	// The bucket should be called at the previous limit to obtain a new reader.
-	ExpectCall(t.bucket, "NewReader")(Any(), rangeStartIs(4)).
-		WillOnce(Return(nil, errors.New("")))
-
-	// Attempt to read four bytes.
-	buf := make([]byte, 4)
-	n, _ := t.rr.ReadAt(buf, 1)
-
-	AssertGe(n, 3)
-	ExpectEq("abc", string(buf[:3]))
+	ExpectEq("abc", string(buf[:objectData.Size]))
 
 	ExpectEq(1, rc.closeCount)
 	ExpectEq(nil, t.rr.wrapped.reader)
@@ -340,9 +365,9 @@ func (t *RandomReaderTest) ReaderExhausted_ReadNotFinished() {
 func (t *RandomReaderTest) PropagatesCancellation() {
 	// Set up a reader that will block until we tell it to return.
 	finishRead := make(chan struct{})
-	rc := ioutil.NopCloser(&blockingReader{finishRead})
+	rc := io.NopCloser(&blockingReader{finishRead})
 
-	t.rr.wrapped.reader = rc
+	t.rr.wrapped.reader = &fake.FakeReader{ReadCloser: rc}
 	t.rr.wrapped.start = 1
 	t.rr.wrapped.limit = 4
 
@@ -380,7 +405,7 @@ func (t *RandomReaderTest) PropagatesCancellation() {
 
 func (t *RandomReaderTest) DoesntPropagateCancellationAfterReturning() {
 	// Set up a reader that will return three bytes.
-	t.rr.wrapped.reader = ioutil.NopCloser(strings.NewReader("xxx"))
+	t.rr.wrapped.reader = &fake.FakeReader{ReadCloser: getReadCloser([]byte("xxx"))}
 	t.rr.wrapped.start = 1
 	t.rr.wrapped.limit = 4
 
@@ -391,10 +416,11 @@ func (t *RandomReaderTest) DoesntPropagateCancellationAfterReturning() {
 	// Successfully read two bytes using a context whose cancellation we control.
 	ctx, cancel := context.WithCancel(context.Background())
 	buf := make([]byte, 2)
-	n, err := t.rr.wrapped.ReadAt(ctx, buf, 1)
+	objectData, err := t.rr.wrapped.ReadAt(ctx, buf, 1)
 
 	AssertEq(nil, err)
-	AssertEq(2, n)
+	ExpectFalse(objectData.CacheHit)
+	AssertEq(2, objectData.Size)
 
 	// If we cancel the calling context now, it should not cause the underlying
 	// read context to be cancelled.
@@ -415,7 +441,7 @@ func (t *RandomReaderTest) UpgradesReadsToObjectSize() {
 	AssertLt(readSize, objectSize)
 
 	// Simulate an existing reader at a mismatched offset.
-	t.rr.wrapped.reader = ioutil.NopCloser(strings.NewReader("xxx"))
+	t.rr.wrapped.reader = &fake.FakeReader{ReadCloser: getReadCloser([]byte("xxx"))}
 	t.rr.wrapped.cancel = func() {}
 	t.rr.wrapped.start = 2
 	t.rr.wrapped.limit = 5
@@ -423,18 +449,21 @@ func (t *RandomReaderTest) UpgradesReadsToObjectSize() {
 	// The bucket should be asked to read the entire object, even though we only
 	// ask for readSize bytes below, to minimize the cost for GCS requests.
 	r := strings.NewReader(strings.Repeat("x", objectSize))
-	rc := ioutil.NopCloser(r)
+	rc := &fake.FakeReader{ReadCloser: io.NopCloser(r)}
 
-	ExpectCall(t.bucket, "NewReader")(
+	ExpectCall(t.bucket, "NewReaderWithReadHandle")(
 		Any(),
 		AllOf(rangeStartIs(1), rangeLimitIs(objectSize))).
 		WillOnce(Return(rc, nil))
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
 
 	// Call through.
 	buf := make([]byte, readSize)
-	t.rr.ReadAt(buf, 1)
+	objectData, err := t.rr.ReadAt(buf, 1)
 
 	// Check the state now.
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(nil, err)
 	ExpectEq(1+readSize, t.rr.wrapped.start)
 	ExpectEq(objectSize, t.rr.wrapped.limit)
 }
@@ -452,27 +481,30 @@ func (t *RandomReaderTest) UpgradeReadsToAverageSize() {
 	// Simulate an existing reader at a mismatched offset.
 	t.rr.wrapped.seeks = numReads
 	t.rr.wrapped.totalReadBytes = totalReadBytes
-	t.rr.wrapped.reader = ioutil.NopCloser(strings.NewReader("xxx"))
+	t.rr.wrapped.reader = &fake.FakeReader{ReadCloser: getReadCloser([]byte("xxx"))}
 	t.rr.wrapped.cancel = func() {}
 	t.rr.wrapped.start = 2
 	t.rr.wrapped.limit = 5
 
 	// The bucket should be asked to read expectedBytesToRead bytes.
 	r := strings.NewReader(strings.Repeat("x", expectedBytesToRead))
-	rc := ioutil.NopCloser(r)
+	rc := &fake.FakeReader{ReadCloser: io.NopCloser(r)}
 
-	ExpectCall(t.bucket, "NewReader")(
+	ExpectCall(t.bucket, "NewReaderWithReadHandle")(
 		Any(),
 		AllOf(
 			rangeStartIs(start),
 			rangeLimitIs(start+expectedBytesToRead),
 		)).WillOnce(Return(rc, nil))
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
 
 	// Call through.
 	buf := make([]byte, readSize)
-	t.rr.ReadAt(buf, start)
+	objectData, err := t.rr.ReadAt(buf, start)
 
 	// Check the state now.
+	ExpectFalse(objectData.CacheHit)
+	AssertEq(nil, err)
 	ExpectEq(start+expectedBytesToRead, t.rr.wrapped.limit)
 }
 
@@ -485,32 +517,39 @@ func (t *RandomReaderTest) UpgradesSequentialReads_ExistingReader() {
 	const existingSize = 3
 	r := strings.NewReader(strings.Repeat("x", existingSize))
 
-	t.rr.wrapped.reader = ioutil.NopCloser(r)
+	t.rr.wrapped.reader = &fake.FakeReader{ReadCloser: io.NopCloser(r)}
 	t.rr.wrapped.cancel = func() {}
 	t.rr.wrapped.start = 1
 	t.rr.wrapped.limit = 1 + existingSize
 
 	// The bucket should be asked to read up to the end of the object.
-	r = strings.NewReader(strings.Repeat("x", readSize-existingSize))
-	rc := ioutil.NopCloser(r)
+	r = strings.NewReader(strings.Repeat("y", readSize))
+	rc := &fake.FakeReader{ReadCloser: io.NopCloser(r)}
 
-	ExpectCall(t.bucket, "NewReader")(
+	ExpectCall(t.bucket, "NewReaderWithReadHandle")(
 		Any(),
-		AllOf(rangeStartIs(1+existingSize), rangeLimitIs(t.object.Size))).
+		AllOf(rangeStartIs(1), rangeLimitIs(1+sequentialReadSizeInBytes))).
 		WillOnce(Return(rc, nil))
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
 
 	// Call through.
 	buf := make([]byte, readSize)
-	t.rr.ReadAt(buf, 1)
+	objectData, err := t.rr.ReadAt(buf, 1)
 
 	// Check the state now.
+	ExpectFalse(objectData.CacheHit)
+	AssertEq(nil, err)
 	ExpectEq(1+readSize, t.rr.wrapped.start)
-	ExpectEq(t.object.Size, t.rr.wrapped.limit)
+	// Limit is same as the byteRange of last GCS call made.
+	ExpectEq(1+sequentialReadSizeInBytes, t.rr.wrapped.limit)
 }
 
 func (t *RandomReaderTest) UpgradesSequentialReads_NoExistingReader() {
 	t.object.Size = 1 << 40
-	const readSize = 10
+	const readSize = 1 * MB
+	// Set up the custom randomReader.
+	rr := NewRandomReader(t.object, t.bucket, readSize/MB, nil, false, common.NewNoopMetrics(), nil)
+	t.rr.wrapped = rr.(*randomReader)
 
 	// Simulate a previous exhausted reader that ended at the offset from which
 	// we read below.
@@ -518,19 +557,540 @@ func (t *RandomReaderTest) UpgradesSequentialReads_NoExistingReader() {
 	t.rr.wrapped.limit = 1
 
 	// The bucket should be asked to read up to the end of the object.
-	r := strings.NewReader(strings.Repeat("x", readSize))
-	rc := ioutil.NopCloser(r)
+	data := strings.Repeat("x", readSize)
+	r := strings.NewReader(data)
+	rc := &fake.FakeReader{ReadCloser: io.NopCloser(r)}
 
-	ExpectCall(t.bucket, "NewReader")(
+	ExpectCall(t.bucket, "NewReaderWithReadHandle")(
 		Any(),
-		AllOf(rangeStartIs(1), rangeLimitIs(t.object.Size))).
+		AllOf(rangeStartIs(1), rangeLimitIs(1+readSize))).
 		WillOnce(Return(rc, nil))
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
 
 	// Call through.
 	buf := make([]byte, readSize)
-	t.rr.ReadAt(buf, 1)
+	objectData, err := t.rr.ReadAt(buf, 1)
 
 	// Check the state now.
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectEq(data, string(objectData.DataBuf))
 	ExpectEq(1+readSize, t.rr.wrapped.start)
-	ExpectEq(t.object.Size, t.rr.wrapped.limit)
+	ExpectEq(1+readSize, t.rr.wrapped.limit)
 }
+
+/******************* File cache specific tests ***********************/
+
+func (t *RandomReaderTest) Test_ReadAt_SequentialFullObject() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rd := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	buf := make([]byte, objectSize)
+	objectData, err := t.rr.ReadAt(buf, 0)
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent, buf))
+
+	objectData, err = t.rr.ReadAt(buf, 0)
+
+	ExpectTrue(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent, buf))
+}
+
+func (t *RandomReaderTest) Test_ReadAt_SequentialRangeRead() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rd := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	start := 0
+	end := 10 // not included
+	AssertLt(end, objectSize)
+	buf := make([]byte, end-start)
+
+	objectData, err := t.rr.ReadAt(buf, int64(start))
+
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent[start:end], buf))
+}
+
+func (t *RandomReaderTest) Test_ReadAt_SequentialSubsequentReadOffsetLessThanReadChunkSize() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	t.object.Size = 20 * util.MiB
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rd := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	start1 := 0
+	end1 := util.MiB // not included
+	AssertLt(end1, objectSize)
+	// First call from offset 0 - sequential read
+	buf := make([]byte, end1-start1)
+	objectData, err := t.rr.ReadAt(buf, int64(start1))
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent[start1:end1], buf))
+	start2 := 3*util.MiB + 4
+	end2 := start2 + util.MiB
+	buf2 := make([]byte, end2-start2)
+
+	// Assuming start2 offset download in progress
+	objectData, err = t.rr.ReadAt(buf2, int64(start2))
+
+	ExpectTrue(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent[start2:end2], buf2))
+}
+
+func (t *RandomReaderTest) Test_ReadAt_RandomReadNotStartWithZeroOffsetWhenCacheForRangeReadIsFalse() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	objectSize := t.object.Size
+	t.rr.wrapped.cacheFileForRangeRead = false
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	start := 5
+	end := 10 // not included
+	rc := &fake.FakeReader{ReadCloser: getReadCloser(testContent[start:])}
+	t.mockNewReaderWithHandleCallForTestBucket(uint64(start), objectSize, rc)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	ExpectCall(t.bucket, "BucketType")().WillRepeatedly(Return(gcs.BucketType{}))
+	buf := make([]byte, end-start)
+	objectData, err := t.rr.ReadAt(buf, int64(start))
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent[start:end], buf))
+	job := t.jobManager.CreateJobIfNotExists(t.object, t.bucket)
+	jobStatus := job.GetStatus()
+	ExpectTrue(jobStatus.Name == downloader.NotStarted)
+
+	// Second read call should be a cache miss
+	objectData, err = t.rr.ReadAt(buf, int64(start))
+
+	ExpectEq(nil, err)
+	ExpectFalse(objectData.CacheHit)
+}
+
+func (t *RandomReaderTest) Test_ReadAt_RandomReadNotStartWithZeroOffsetWhenCacheForRangeReadIsTrue() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	objectSize := t.object.Size
+	t.rr.wrapped.cacheFileForRangeRead = true
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	start := 5
+	end := 10 // not included
+	rd := &fake.FakeReader{ReadCloser: getReadCloser(testContent[start:])}
+	// Mock for random-reader's NewReader call
+	t.mockNewReaderWithHandleCallForTestBucket(uint64(start), objectSize, rd)
+	rd1 := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	// Mock for download job's NewReader call
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd1)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
+	buf := make([]byte, end-start)
+
+	objectData, err := t.rr.ReadAt(buf, int64(start))
+
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent[start:end], buf))
+	job := t.jobManager.GetJob(t.object.Name, t.bucket.Name())
+	ExpectTrue(job == nil || job.GetStatus().Name == downloader.Downloading)
+}
+
+func (t *RandomReaderTest) Test_ReadAt_SequentialToRandomSubsequentReadOffsetMoreThanReadChunkSize() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	t.object.Size = 20 * util.MiB
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rd := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	// Mock for download job's NewReader call
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
+	start1 := 0
+	end1 := util.MiB // not included
+	AssertLt(end1, objectSize)
+	// First call from offset 0 - sequential read
+	buf := make([]byte, end1-start1)
+	objectData, err := t.rr.ReadAt(buf, int64(start1))
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent[start1:end1], buf))
+	start2 := 16*util.MiB + 4
+	end2 := start2 + util.MiB
+	rd2 := &fake.FakeReader{ReadCloser: getReadCloser(testContent[start2:])}
+	// Mock for random-reader's NewReader call
+	t.mockNewReaderWithHandleCallForTestBucket(uint64(start2), objectSize, rd2)
+	buf2 := make([]byte, end2-start2)
+
+	// Assuming start2 offset download in progress
+	objectData, err = t.rr.ReadAt(buf2, int64(start2))
+
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent[start2:end2], buf2))
+}
+
+func (t *RandomReaderTest) Test_ReadAt_SequentialToRandomSubsequentReadOffsetLessThanPrevious() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	t.object.Size = 20 * util.MiB
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rc := getReadCloser(testContent)
+	t.mockNewReaderCallForTestBucket(0, objectSize, rc)
+	rd := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
+	start1 := 0
+	end1 := util.MiB // not included
+	AssertLt(end1, objectSize)
+	// First call from offset 0 - sequential read
+	buf := make([]byte, end1-start1)
+	objectData, err := t.rr.ReadAt(buf, int64(start1))
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent[start1:end1], buf))
+	start2 := 16*util.MiB + 4
+	end2 := start2 + util.MiB
+	rc2 := &fake.FakeReader{ReadCloser: getReadCloser(testContent[start2:])}
+	t.mockNewReaderWithHandleCallForTestBucket(uint64(start2), objectSize, rc2)
+	buf2 := make([]byte, end2-start2)
+	// Assuming start2 offset download in progress
+	objectData, err = t.rr.ReadAt(buf2, int64(start2))
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent[start2:end2], buf2))
+	start3 := util.MiB
+	end3 := start3 + util.MiB
+	buf3 := make([]byte, end3-start3)
+
+	objectData, err = t.rr.ReadAt(buf3, int64(start3))
+
+	ExpectEq(nil, err)
+	ExpectTrue(objectData.CacheHit)
+	ExpectTrue(reflect.DeepEqual(testContent[start3:end3], buf3))
+}
+
+func (t *RandomReaderTest) Test_ReadAt_CacheMissDueToInvalidJob() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rc1 := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rc1)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
+	buf := make([]byte, objectSize)
+	objectData, err := t.rr.ReadAt(buf, 0)
+	AssertEq(nil, err)
+	ExpectFalse(objectData.CacheHit)
+	AssertTrue(reflect.DeepEqual(testContent, buf))
+	job := t.jobManager.GetJob(t.object.Name, t.bucket.Name())
+	if job != nil {
+		jobStatus := job.GetStatus().Name
+		AssertTrue(jobStatus == downloader.Downloading || jobStatus == downloader.Completed, fmt.Sprintf("the actual status is %v", jobStatus))
+	}
+
+	err = t.rr.wrapped.fileCacheHandler.InvalidateCache(t.object.Name, t.bucket.Name())
+	AssertEq(nil, err)
+	// Second reader (rc2) is required, since first reader (rc) is completely read.
+	// Reading again will return EOF.
+	rc2 := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rc2)
+
+	objectData, err = t.rr.ReadAt(buf, 0)
+
+	ExpectEq(nil, err)
+	ExpectFalse(objectData.CacheHit)
+	ExpectTrue(reflect.DeepEqual(testContent, buf))
+	ExpectEq(nil, t.rr.wrapped.fileCacheHandle)
+}
+
+func (t *RandomReaderTest) Test_ReadAt_CachePopulatedAndThenCacheMissDueToInvalidJob() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rd1 := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd1)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
+	buf := make([]byte, objectSize)
+	objectData, err := t.rr.ReadAt(buf, 0)
+	AssertEq(nil, err)
+	AssertFalse(objectData.CacheHit)
+	AssertTrue(reflect.DeepEqual(testContent, buf))
+	job := t.jobManager.GetJob(t.object.Name, t.bucket.Name())
+	if job != nil {
+		jobStatus := job.GetStatus().Name
+		AssertTrue(jobStatus == downloader.Downloading || jobStatus == downloader.Completed, fmt.Sprintf("the actual status is %v", jobStatus))
+	}
+	err = t.rr.wrapped.fileCacheHandler.InvalidateCache(t.object.Name, t.bucket.Name())
+	AssertEq(nil, err)
+	// Second reader (rc2) is required, since first reader (rc) is completely read.
+	// Reading again will return EOF.
+	rc2 := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rc2)
+	objectData, err = t.rr.ReadAt(buf, 0)
+	ExpectEq(nil, err)
+	ExpectFalse(objectData.CacheHit)
+	ExpectTrue(reflect.DeepEqual(testContent, buf))
+	ExpectEq(nil, t.rr.wrapped.fileCacheHandle)
+	rd3 := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd3)
+
+	objectData, err = t.rr.ReadAt(buf, 0)
+
+	ExpectEq(nil, err)
+	ExpectFalse(objectData.CacheHit)
+	ExpectTrue(reflect.DeepEqual(testContent, buf))
+	ExpectNe(nil, t.rr.wrapped.fileCacheHandle)
+}
+
+func (t *RandomReaderTest) Test_ReadAt_CachePopulatedAndThenCacheMissDueToInvalidFileHandle() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rd := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
+	buf := make([]byte, objectSize)
+	objectData, err := t.rr.ReadAt(buf, 0)
+	AssertEq(nil, err)
+	AssertFalse(objectData.CacheHit)
+	AssertTrue(reflect.DeepEqual(testContent, buf))
+	AssertNe(nil, t.rr.wrapped.fileCacheHandle)
+	err = t.rr.wrapped.fileCacheHandle.Close()
+	AssertEq(nil, err)
+	// Second reader (rc2) is required, since first reader (rc) is completely read.
+	// Reading again will return EOF.
+	rc2 := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderCallForTestBucket(0, objectSize, rc2)
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rc2)
+	objectData, err = t.rr.ReadAt(buf, 0)
+	ExpectEq(nil, err)
+	ExpectFalse(objectData.CacheHit)
+	ExpectTrue(reflect.DeepEqual(testContent, buf))
+	ExpectEq(nil, t.rr.wrapped.fileCacheHandle)
+	rc3 := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rc3)
+
+	objectData, err = t.rr.ReadAt(buf, 0)
+
+	ExpectEq(nil, err)
+	ExpectTrue(objectData.CacheHit)
+	ExpectTrue(reflect.DeepEqual(testContent, buf))
+	ExpectNe(nil, t.rr.wrapped.fileCacheHandle)
+}
+
+func (t *RandomReaderTest) Test_ReadAt_IfCacheFileGetsDeleted() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rd := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	buf := make([]byte, objectSize)
+	objectData, err := t.rr.ReadAt(buf, 0)
+	AssertEq(nil, err)
+	AssertFalse(objectData.CacheHit)
+	AssertTrue(reflect.DeepEqual(testContent, buf))
+	AssertNe(nil, t.rr.wrapped.fileCacheHandle)
+	err = t.rr.wrapped.fileCacheHandle.Close()
+	AssertEq(nil, err)
+	t.rr.wrapped.fileCacheHandle = nil
+	// Delete the local cache file.
+	filePath := util.GetDownloadPath(t.cacheDir, util.GetObjectPath(t.bucket.Name(), t.object.Name))
+	err = os.Remove(filePath)
+	AssertEq(nil, err)
+	// Second reader (rc2) is required, since first reader (rc) is completely read.
+	// Reading again will return EOF.
+	t.mockNewReaderCallForTestBucket(0, objectSize, getReadCloser(testContent))
+
+	_, err = t.rr.ReadAt(buf, 0)
+
+	AssertNe(nil, err)
+	ExpectTrue(strings.Contains(err.Error(), util.FileNotPresentInCacheErrMsg))
+}
+
+func (t *RandomReaderTest) Test_ReadAt_IfCacheFileGetsDeletedWithCacheHandleOpen() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rd := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	buf := make([]byte, objectSize)
+	objectData, err := t.rr.ReadAt(buf, 0)
+	AssertEq(nil, err)
+	AssertFalse(objectData.CacheHit)
+	AssertTrue(reflect.DeepEqual(testContent, buf))
+	AssertNe(nil, t.rr.wrapped.fileCacheHandle)
+	// Delete the local cache file.
+	filePath := util.GetDownloadPath(t.cacheDir, util.GetObjectPath(t.bucket.Name(), t.object.Name))
+	err = os.Remove(filePath)
+	AssertEq(nil, err)
+
+	// Read via cache only, as we have old fileHandle open and linux
+	// doesn't delete the file until the fileHandle count for the file is zero.
+	objectData, err = t.rr.ReadAt(buf, 0)
+
+	AssertEq(nil, err)
+	ExpectTrue(objectData.CacheHit)
+	ExpectTrue(reflect.DeepEqual(testContent, buf))
+	ExpectNe(nil, t.rr.wrapped.fileCacheHandle)
+}
+
+func (t *RandomReaderTest) Test_ReadAt_FailedJobRestartAndCacheHit() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rc := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	// First call goes to file cache succeeded by next call to random reader.
+	// First NewReaderWithReadHandle-call throws error, hence async job fails.
+	// Later NewReader-call returns a valid readCloser object hence fallback to
+	// GCS read will succeed.
+	ExpectCall(t.bucket, "NewReaderWithReadHandle")(Any(), Any()).
+		WillOnce(Return(nil, errors.New(""))).WillRepeatedly(Return(rc, nil))
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	ExpectCall(t.bucket, "BucketType")().WillOnce(Return(gcs.BucketType{}))
+	buf := make([]byte, objectSize)
+	objectData, err := t.rr.ReadAt(buf, 0)
+	AssertEq(nil, err)
+	ExpectFalse(objectData.CacheHit)
+	AssertTrue(reflect.DeepEqual(testContent, buf))
+	job := t.jobManager.GetJob(t.object.Name, t.bucket.Name())
+	AssertTrue(job == nil || job.GetStatus().Name == downloader.Failed)
+	// Second reader (rc2) is required, since first reader (rc) is completely read.
+	// Reading again will return EOF.
+	rd2 := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd2)
+	// This call will populate the cache again.
+	objectData, err = t.rr.ReadAt(buf, 0)
+	ExpectEq(nil, err)
+	ExpectFalse(objectData.CacheHit)
+	ExpectTrue(reflect.DeepEqual(testContent, buf))
+	ExpectNe(nil, t.rr.wrapped.fileCacheHandle)
+
+	objectData, err = t.rr.ReadAt(buf, 0)
+
+	ExpectEq(nil, err)
+	ExpectTrue(objectData.CacheHit)
+	ExpectTrue(reflect.DeepEqual(testContent, buf))
+	ExpectNe(nil, t.rr.wrapped.fileCacheHandle)
+}
+
+// Only writing two unit tests for tryReadingFromFileCache as
+// unit tests of ReadAt method covers all the workflows.
+func (t *RandomReaderTest) Test_tryReadingFromFileCache_CacheHit() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rd := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	buf := make([]byte, objectSize)
+	// First read will be a cache miss.
+	_, cacheHit, err := t.rr.wrapped.tryReadingFromFileCache(t.rr.ctx, buf, 0)
+	ExpectFalse(cacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent, buf))
+
+	// Second read will be a cache hit.
+	_, cacheHit, err = t.rr.wrapped.tryReadingFromFileCache(t.rr.ctx, buf, 0)
+	ExpectTrue(cacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent, buf))
+}
+
+func (t *RandomReaderTest) Test_tryReadingFromFileCache_CacheMiss() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	t.rr.wrapped.cacheFileForRangeRead = false
+	start := 5
+	end := 10
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	buf := make([]byte, end-start)
+
+	_, cacheHit, err := t.rr.wrapped.tryReadingFromFileCache(t.rr.ctx, buf, int64(start))
+
+	ExpectFalse(cacheHit)
+	ExpectEq(nil, err)
+}
+
+func (t *RandomReaderTest) Test_ReadAt_OffsetEqualToObjectSize() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	t.object.Size = util.MiB
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rd := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	start1 := 0
+	end1 := util.MiB // equal to objectSize
+	// First call from offset 0 - objectSize
+	buf := make([]byte, end1-start1)
+	objectData, err := t.rr.ReadAt(buf, int64(start1))
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(nil, err)
+	ExpectTrue(reflect.DeepEqual(testContent[start1:end1], buf))
+	start2 := util.MiB // offset equal to objectSize
+	end2 := start2 + util.MiB
+	buf2 := make([]byte, end2-start2)
+
+	// read for offset equal to objectSize
+	objectData, err = t.rr.ReadAt(buf2, int64(start2))
+
+	// nothing should be read
+	ExpectFalse(objectData.CacheHit)
+	ExpectEq(io.EOF, err)
+	ExpectEq(0, objectData.Size)
+}
+
+func (t *RandomReaderTest) Test_Destroy_NilCacheHandle() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+
+	t.rr.Destroy()
+
+	ExpectEq(nil, t.rr.wrapped.fileCacheHandle)
+}
+
+func (t *RandomReaderTest) Test_Destroy_NonNilCacheHandle() {
+	t.rr.wrapped.fileCacheHandler = t.cacheHandler
+	objectSize := t.object.Size
+	testContent := testutil.GenerateRandomBytes(int(objectSize))
+	rd := &fake.FakeReader{ReadCloser: getReadCloser(testContent)}
+	t.mockNewReaderWithHandleCallForTestBucket(0, objectSize, rd)
+	ExpectCall(t.bucket, "Name")().WillRepeatedly(Return("test"))
+	buf := make([]byte, objectSize)
+	_, cacheHit, err := t.rr.wrapped.tryReadingFromFileCache(t.rr.ctx, buf, 0)
+	AssertFalse(cacheHit)
+	AssertEq(nil, err)
+	AssertTrue(reflect.DeepEqual(testContent, buf))
+	AssertNe(nil, t.rr.wrapped.fileCacheHandle)
+
+	t.rr.wrapped.Destroy()
+
+	ExpectEq(nil, t.rr.wrapped.fileCacheHandle)
+}
+
+func (t *RandomReaderTest) TestNewReader_FileClobbered() {
+	var notFoundError *gcs.NotFoundError
+
+	ExpectCall(t.bucket, "NewReaderWithReadHandle")(Any(), Any()).
+		WillOnce(Return(nil, notFoundError))
+
+	err := t.rr.wrapped.startRead(0, 1)
+
+	AssertNe(nil, err)
+	var clobberedErr *gcsfuse_errors.FileClobberedError
+	AssertTrue(errors.As(err, &clobberedErr))
+}
+
+// TODO (raj-prince) - to add unit tests for failed scenario while reading via cache.
+// This requires mocking CacheHandle object, whose read method will return some unexpected
+// error.
