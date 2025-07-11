@@ -20,7 +20,6 @@ import (
 	"io"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/googlecloudplatform/gcsfuse/v3/cfg"
@@ -394,7 +393,8 @@ func (f *FileInode) Source() *gcs.MinObject {
 func (f *FileInode) SourceGenerationIsAuthoritative() bool {
 	// Source generation is authoritative if:
 	//   1.  No pending writes exists on the inode (both content and bwh are nil).
-	return f.content == nil && f.bwh == nil
+	//   2.  The bucket is zonal and there are no pending writes in the temporary file.
+	return (f.content == nil && f.bwh == nil) || (f.bucket.BucketType().Zonal && f.content == nil)
 }
 
 // Equivalent to the generation returned by f.Source().
@@ -469,9 +469,8 @@ func (f *FileInode) Destroy() (err error) {
 
 // LOCKS_REQUIRED(f.mu)
 func (f *FileInode) Attributes(
-	ctx context.Context) (attrs fuseops.InodeAttributes, err error) {
+	ctx context.Context, clobberedCheck bool) (attrs fuseops.InodeAttributes, err error) {
 	attrs = f.attrs
-
 	// Obtain default information from the source object.
 	attrs.Mtime = f.src.Updated
 	attrs.Size = f.src.Size
@@ -519,18 +518,25 @@ func (f *FileInode) Attributes(
 	attrs.Atime = attrs.Mtime
 	attrs.Ctime = attrs.Mtime
 
-	// If the object has been clobbered, we reflect that as the inode being
-	// unlinked.
-	_, clobbered, err := f.clobbered(ctx, false, false)
-	if err != nil {
-		err = fmt.Errorf("clobbered: %w", err)
-		return
+	if clobberedCheck {
+		// If the object has been clobbered, we reflect that as the inode being
+		// unlinked.
+		var clobbered bool
+		_, clobbered, err = f.clobbered(ctx, false, false)
+		if err != nil {
+			err = fmt.Errorf("clobbered: %w", err)
+			return
+		}
+		if clobbered {
+			attrs.Nlink = 0
+			return
+		}
 	}
 
 	attrs.Nlink = 1
 
 	// For local files, also checking if file is unlinked locally.
-	if clobbered || (f.IsLocal() && f.IsUnlinked()) {
+	if f.IsLocal() && f.IsUnlinked() {
 		attrs.Nlink = 0
 	}
 
@@ -551,9 +557,8 @@ func (f *FileInode) Read(
 	ctx context.Context,
 	dst []byte,
 	offset int64) (n int, err error) {
-	// It is not nil when streaming writes are enabled and bucket type is Zonal.
 	if f.bwh != nil {
-		err = fmt.Errorf("cannot read a file when upload in progress: %w", syscall.ENOTSUP)
+		err = fmt.Errorf("unexpected read call for %q when streaming write is in progress for it", f.Name().LocalName())
 		return
 	}
 

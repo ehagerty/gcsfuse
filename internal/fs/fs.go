@@ -1348,7 +1348,7 @@ func (fs *fileSystem) getAttributes(
 	expiration time.Time,
 	err error) {
 	// Call through.
-	attr, err = in.Attributes(ctx)
+	attr, err = in.Attributes(ctx, true)
 	if err != nil {
 		return
 	}
@@ -2587,10 +2587,16 @@ func (fs *fileSystem) ReadFile(
 	fh.Lock()
 	fh.Inode().Lock()
 	defer fh.Unlock()
-	// TODO(b/417136852): Remove bucket type check when we start leaving zonal bucket objects unfinalized.
-	// Flush Pending streaming writes file for regional bucket and issue read within same inode lock.
-	if fh.Inode().IsUsingBWH() && !fh.Inode().Bucket().BucketType().Zonal {
-		err = fs.flushFile(ctx, fh.Inode())
+	if fh.Inode().IsUsingBWH() {
+		// Flush Pending streaming writes and issue read within same inode lock.
+		// TODO(b/417136852): Remove bucket type check and call only flushFile
+		// when we start leaving zonal bucket objects unfinalized.
+		if !fh.Inode().Bucket().BucketType().Zonal {
+			err = fs.flushFile(ctx, fh.Inode())
+		} else {
+			// Flush but don't finalize, in zonal bucket.
+			err = fs.syncFile(ctx, fh.Inode())
+		}
 		if err != nil {
 			fh.Inode().Unlock()
 			return err
