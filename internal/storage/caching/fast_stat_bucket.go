@@ -122,10 +122,6 @@ func (b *fastStatBucket) insertListing(ctx context.Context, listing *gcs.Listing
 
 	expiration := b.clock.Now().Add(b.primaryCacheTTL)
 
-	// Track object names to avoid redundant caching of prefixes
-	// that already exist as explicit objects.
-	minObjectNames := make(map[string]struct{})
-
 	// 1. Parent Directory Inference (Implicit Check)
 	// If the listing contains objects or sub-directories but the directory itself
 	// is not returned as an explicit object, we infer and cache it as an
@@ -133,26 +129,17 @@ func (b *fastStatBucket) insertListing(ctx context.Context, listing *gcs.Listing
 	dirHasContents := len(listing.MinObjects) > 0 || len(listing.CollapsedRuns) > 0
 	isDirInListing := len(listing.MinObjects) > 0 && listing.MinObjects[0].Name == dirName
 	if dirHasContents && !isDirInListing {
-		m := &gcs.MinObject{
-			Name: dirName,
-		}
-		b.cache.Insert(m, expiration)
+		b.cache.InsertImplicitDir(dirName, expiration)
 	}
 
 	// 2. Cache Explicit Objects
 	for _, o := range listing.MinObjects {
 		b.cache.Insert(o, expiration)
-		minObjectNames[o.Name] = struct{}{}
 	}
 
 	// 3. Cache Sub-directories (Collapsed Runs)
 	// These represent folders discovered via prefixes in the ListObjects response.
 	for _, p := range listing.CollapsedRuns {
-		// Skip if this name was already cached as an explicit object.
-		if _, exists := minObjectNames[p]; exists {
-			continue
-		}
-
 		// Ensure the prefix follows directory naming conventions (trailing slash).
 		// Although 'collapsedRuns' is expected to contain only directories, we perform
 		// this defensive check to prevent processing malformed prefixes.
@@ -162,10 +149,7 @@ func (b *fastStatBucket) insertListing(ctx context.Context, listing *gcs.Listing
 		}
 
 		// Cache the prefix as a minimal object (implicit directory marker).
-		m := &gcs.MinObject{
-			Name: p,
-		}
-		b.cache.Insert(m, expiration)
+		b.cache.InsertImplicitDir(p, expiration)
 	}
 }
 
