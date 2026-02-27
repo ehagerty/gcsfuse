@@ -310,3 +310,7 @@ func (d *baseDirInode) Context() context.Context {
 	// is not allowed, so a nil context suffices.
 	return nil
 }
+
+func (d *baseDirInode) IncrementActiveWriters() {}
+
+func (d *baseDirInode) DecrementActiveWriters() {}

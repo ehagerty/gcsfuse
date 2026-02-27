@@ -57,6 +57,10 @@ type MetadataPrefetcher struct {
 
 	// listCallFunc allows the prefetcher to perform GCS List call and hydrate metadata cache.
 	listCallFunc func(ctx context.Context, tok string, startOffset string, limit int) (map[Name]*Core, []string, string, error)
+
+	// shouldRun is a callback that returns true if prefetching is allowed.
+	// It checks if there are any active writers in the directory.
+	shouldRun func() bool
 }
 
 func NewMetadataPrefetcher(
@@ -65,6 +69,7 @@ func NewMetadataPrefetcher(
 	prefetchSem *semaphore.Weighted, // Shared semaphore across all MetadataPrefetchers.
 	cacheClock timeutil.Clock,
 	listFunc func(context.Context, string, string, int) (map[Name]*Core, []string, string, error),
+	shouldRun func() bool,
 ) *MetadataPrefetcher {
 	return &MetadataPrefetcher{
 		inodeCtx:         inodeCtx,
@@ -73,6 +78,7 @@ func NewMetadataPrefetcher(
 		cacheClock:       cacheClock,
 		sem:              prefetchSem,
 		listCallFunc:     listFunc,
+		shouldRun:        shouldRun,
 		// state is 0 (prefetchReady) by default.
 	}
 }
@@ -83,18 +89,19 @@ func NewMetadataPrefetcher(
 func (p *MetadataPrefetcher) Run(fullObjectName string) {
 	// Do not trigger prefetching if:
 	// 1. The inode context is nil or already cancelled (dir inode is dead/renamed).
-	if p.inodeCtx == nil || p.inodeCtx.Err() != nil {
+	// 2. If there are active writers in the directory, do not trigger prefetch.
+	if p.inodeCtx == nil || p.inodeCtx.Err() != nil || !p.shouldRun() {
 		return
 	}
 
-	//5. Do not trigger prefetch if the last prefetch result is still within the TTL.
+	// Do not trigger prefetch if the last prefetch result is still within the TTL.
 	lastPrefetchTime := p.lastPrefetchTime.Load()
 	now := p.cacheClock.Now()
 	if lastPrefetchTime != nil && now.Sub(*lastPrefetchTime) < p.metadataCacheTTL {
 		return
 	}
 
-	// 6. Ensure only one prefetch runs at a time for this directory.
+	// Ensure only one prefetch runs at a time for this directory.
 	if !p.state.CompareAndSwap(prefetchReady, prefetchInProgress) {
 		return
 	}
